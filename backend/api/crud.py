@@ -32,3 +32,9 @@ def get_total_traded_volume_today(db: Session):
     start = datetime(today.year, today.month, today.day)
     total = db.query(func.coalesce(func.sum(models.Trade.volume),0)).filter(models.Trade.ts>=start).scalar()
     return float(total or 0.0)
+def insert_trade_with_session(db: Session, pair: str, action: str, price: float, volume: float, status="Filled", strategy=None):
+    tr = models.Trade(pair=pair.upper(), action=action.upper(), price=price, volume=volume, status=status, strategy=strategy)
+    db.add(tr)
+    db.commit()
+    db.refresh(tr)
+    return tr

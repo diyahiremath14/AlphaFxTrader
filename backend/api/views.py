@@ -6,6 +6,10 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from .database import SessionLocal, engine, Base
 from . import models, crud, sma_service, broadcast, serializers
+from fastapi import BackgroundTasks
+
+# import loader and trade engine
+from . import load_prices, trade_engine
 
 # load env from backend/.env
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -77,3 +81,30 @@ async def ws_prices(websocket: WebSocket):
             await websocket.receive_text()
     except Exception:
         broadcast.manager.disconnect(websocket)
+
+
+@app.post("/internal/load_csv")
+def api_load_csv(filepath: str = None, background_tasks: BackgroundTasks = None):
+    """
+    Trigger CSV import; returns immediately if background_tasks provided.
+    filepath defaults to backend/fx_prices.csv
+    """
+    path = filepath if filepath else os.path.join(os.path.dirname(__file__), '..', 'fx_prices.csv')
+    if background_tasks:
+        background_tasks.add_task(load_prices.parse_and_load, path)
+        return {"ok": True, "message": "CSV import started in background"}
+    else:
+        load_prices.parse_and_load(path)
+        return {"ok": True, "message": "CSV import finished"}
+
+@app.post("/internal/run_sma")
+def api_run_sma(background_tasks: BackgroundTasks = None):
+    """
+    Trigger SMA trading run. For production, schedule this, or wire to middleware.
+    """
+    if background_tasks:
+        background_tasks.add_task(trade_engine.run_sma)
+        return {"ok": True, "message": "SMA strategy started in background"}
+    else:
+        trade_engine.run_sma()
+        return {"ok": True, "message": "SMA strategy finished"}
