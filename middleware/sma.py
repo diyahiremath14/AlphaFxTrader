@@ -1,6 +1,13 @@
 import collections
 from datetime import datetime
+import yfinance as yf
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+import threading
+import time
 
+# -------- SMA Trading Model --------
 class SMA_TradingModel:
     def __init__(self,
                  short_window=5,
@@ -14,31 +21,27 @@ class SMA_TradingModel:
         self.trade_size = trade_size
         self.high_low_window = high_low_window
         
-        # Sliding windows for SMA and high/low tracking
         self.price_window_short = collections.deque(maxlen=short_window)
         self.price_window_long = collections.deque(maxlen=long_window)
         self.price_window_high_low = collections.deque(maxlen=high_low_window)
         
-        self.position = None  # 'LONG', 'SHORT', or None
+        self.position = None
         self.cumulative_volume = 0
         self.trade_log = []
         self.prev_diff = None
-        self.purchase_price = None  # store the price at which current position was opened
+        self.purchase_price = None
     
     def add_price(self, price: float):
-        """Add new price tick to SMA and high/low windows."""
         self.price_window_short.append(price)
         self.price_window_long.append(price)
         self.price_window_high_low.append(price)
     
     def calculate_sma(self, price_deque):
-        """Calculate SMA for given deque."""
         if len(price_deque) == 0:
             return None
         return sum(price_deque) / len(price_deque)
     
     def generate_signal(self):
-        """Generate BUY/SELL signals based on SMA crossover."""
         sma_short = self.calculate_sma(self.price_window_short)
         sma_long = self.calculate_sma(self.price_window_long)
         
@@ -58,12 +61,11 @@ class SMA_TradingModel:
         return signal
     
     def execute_trade(self, signal):
-        """Execute trades respecting volume limits and track position."""
         if signal is None:
             return
         
         if self.cumulative_volume >= self.trade_volume_limit:
-            print("[INFO] Max trade volume reached. Halting trades.")
+            print("[INFO] Trade volume limit reached. No further trades.")
             return
         
         if signal == 'BUY' and self.position != 'LONG':
@@ -74,20 +76,17 @@ class SMA_TradingModel:
             print(f"[TRADE] BUY executed at {self.purchase_price} for volume {self.trade_size}")
         
         elif signal == 'SELL' and self.position == 'LONG':
-            self._log_trade('SELL')
-            # Calculate profit/loss on closing
             sell_price = self.price_window_short[-1]
             pnl = sell_price - self.purchase_price if self.purchase_price else None
-            print(f"[TRADE] SELL executed at {sell_price} for volume {self.trade_size}, PnL: {pnl}")
+            self._log_trade('SELL')
             self.position = 'SHORT'
             self.cumulative_volume += self.trade_size
-            self.purchase_price = None  # position closed
-        
+            self.purchase_price = None
+            print(f"[TRADE] SELL executed at {sell_price} for volume {self.trade_size}, PnL: {pnl}")
         else:
             print(f"[INFO] No trade executed for signal: {signal}")
     
     def _log_trade(self, trade_type):
-        """Log trade with timestamp."""
         trade_record = {
             'timestamp': datetime.utcnow().isoformat(),
             'type': trade_type,
@@ -98,62 +97,92 @@ class SMA_TradingModel:
         print(f"[LOG] Trade recorded: {trade_record}")
     
     def process_tick(self, price):
-        """Main entry point: process new price tick, run logic."""
         self.add_price(price)
         signal = self.generate_signal()
         self.execute_trade(signal)
     
     def get_high_low(self):
-        """Return highest and lowest price within the high_low window."""
         if not self.price_window_high_low:
             return None, None
         return max(self.price_window_high_low), min(self.price_window_high_low)
     
     def get_average_trade_volume(self):
-        """Calculate average trade volume over all logged trades."""
         if not self.trade_log:
             return 0
         total_volume = sum(trade['volume'] for trade in self.trade_log)
         return total_volume / len(self.trade_log)
     
     def get_current_price(self):
-        """Return the latest price received."""
         if not self.price_window_short:
             return None
         return self.price_window_short[-1]
     
     def get_purchase_price(self):
-        """Return the purchase price of the current position."""
         return self.purchase_price
     
     def get_profit_loss(self):
-        """Compute live profit/loss for open long position."""
         current_price = self.get_current_price()
         if self.position == 'LONG' and self.purchase_price is not None and current_price is not None:
             return current_price - self.purchase_price
         return None
 
-# Example usage (assuming cleaned data available)
-if __name__ == "__main__":
-    import pandas as pd
-    
-    df = pd.read_csv('fx_dataset.csv')  # Replace with your dataset file
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.sort_values('timestamp', inplace=True)
-    
-    model = SMA_TradingModel()
-    
-    for index, row in df.iterrows():
-        model.process_tick(row['close'])
-        high, low = model.get_high_low()
-        avg_volume = model.get_average_trade_volume()
-        current_price = model.get_current_price()
-        purchase_price = model.get_purchase_price()
-        pnl = model.get_profit_loss()
-        
-        print(f"Tick {index}: Current Price: {current_price}, High: {high}, Low: {low}, "
-              f"Avg Volume: {avg_volume}, Purchase Price: {purchase_price}, P/L: {pnl}")
-    
-    print("\nFinal Trade Log:")
-    for trade in model.trade_log:
-        print(trade)
+# ---------- FastAPI App and Models ----------
+
+app = FastAPI()
+sma_model = SMA_TradingModel()
+
+class PriceTick(BaseModel):
+    price: float
+
+# Endpoint to submit new price tick manually (optional)
+@app.post("/price_tick/")
+async def submit_price_tick(tick: PriceTick):
+    sma_model.process_tick(tick.price)
+    return {"message": "Price tick processed"}
+
+# Endpoint to get current model stats
+@app.get("/status/")
+async def get_status():
+    high, low = sma_model.get_high_low()
+    avg_volume = sma_model.get_average_trade_volume()
+    current_price = sma_model.get_current_price()
+    purchase_price = sma_model.get_purchase_price()
+    profit_loss = sma_model.get_profit_loss()
+    return {
+        "current_price": current_price,
+        "high": high,
+        "low": low,
+        "average_trade_volume": avg_volume,
+        "purchase_price": purchase_price,
+        "profit_loss": profit_loss,
+        "position": sma_model.position,
+        "trade_log": sma_model.trade_log[-10:]  # Last 10 trades
+    }
+
+# Background thread to fetch live prices from Yahoo Finance for a symbol
+def live_price_feed(symbol="EURUSD=X", interval="1m", delay=60):
+    """
+    Fetches latest price every 'delay' seconds and feeds to SMA model.
+    symbol: ticker symbol supported by yfinance
+    interval: data interval
+    delay: seconds between fetches
+    """
+    while True:
+        data = yf.download(tickers=symbol, period="1d", interval=interval, progress=False)
+        if not data.empty:
+            last_price = data['Close'].iloc[-1]
+            print(f"[YFinance] Latest {symbol} price: {last_price}")
+            sma_model.process_tick(last_price)
+        else:
+            print("[YFinance] No data fetched")
+        time.sleep(delay)
+
+# Start background fetch thread on app startup
+@app.on_event("startup")
+def start_background_tasks():
+    thread = threading.Thread(target=live_price_feed, args=("EURUSD=X", "1m", 60), daemon=True)
+    thread.start()
+
+# Run the FastAPI app with:
+# uvicorn this_file_name:app --reload
+
